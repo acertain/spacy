@@ -1,0 +1,4 @@
+packages: .
+profiling: True
+executable-profiling: True
+

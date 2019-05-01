@@ -1,0 +1,15 @@
+:set +c
+:set -Wall
+:set -Wno-unused-matches
+:set -Wno-name-shadowing
+:set -Wno-type-defaults
+:set -Wno-orphans
+:set -Wno-missing-signatures
+:set -Wno-partial-type-signatures
+:set -Wno-missing-home-modules
+:set -Wno-unticked-promoted-constructors 
+
+:set -fshow-loaded-modules
+
+
+:set -XImplicitPrelude
