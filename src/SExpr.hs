@@ -9,10 +9,11 @@ import qualified Text.PrettyPrint.ANSI.Leijen as P
 import Data.Data.Lens
 
 
--- TODO: rename A -> V
 -- TODO: add constructor for datatypes, that holds metadata, to allow
 -- datatypes without having to thread state around
 -- or could just have a global table & mutate it in IO & use unsafePerformIO?
+-- TODO: remove A: distinction between free in A and B makes round-tripping impossible, which is bad
+-- should check to see if de bruijn is part of the spec or just z3's extension
 data SExpr = A (Name SExpr) | B String | L [SExpr]
   deriving (Generic, Data, Eq)
 

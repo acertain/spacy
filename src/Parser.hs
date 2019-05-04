@@ -5,7 +5,7 @@ module Parser where
 import Text.Parsix hiding (ident)
 import Prelude hiding (noneOf)
 
-
+-- TODO: split into var (just capital letters) & atom
 ident :: Parser String
 ident = some $ noneOf " ,.()"
 

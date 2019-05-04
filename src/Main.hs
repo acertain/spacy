@@ -2,6 +2,7 @@
 module Main where
 
 import Unbound.Generics.LocallyNameless
+-- import Unbound.Generics.LocallyNameless.Bind
 import qualified Data.IntMap.Internal
 import qualified Data.IntMap.Lazy as IM
 import Parser
@@ -35,9 +36,12 @@ import Control.Lens.Unsound
 -- import qualified Data.SBV.List as L
 
 -- SVar to just to make conversion to smt easier
+-- currently, we're abusing Var instead of having a SVar
 data Term = Var (Name Term) | Constr String [Term] | SExpr (Ignore SExpr)
   -- | SVar (Ignore (Name SExpr))
   deriving (Show, Generic, Data, Eq)
+-- TODO: add a Body type, or mb use Term for it
+-- to abstract over the [(Rule,[Term])] & be able to do non-dnf defns
 newtype Clause = Clause (Bind [Name Term] [(Rule,[Term])])
   deriving (Show, Generic, Data)
 
@@ -111,6 +115,16 @@ instance Eq Query where
 instance Ord Query where
   compare = compare `on` _queryLvl
 
+-- we just use variable names from the input for the solver, and rely on
+-- well-scopedness of the input to give us locally unique variable names
+data PredState = PredState {
+  _predSolver :: S.Solver,
+  -- bool vars for clauses
+  _predClauseVars :: [Name SExpr]
+}
+
+
+
 data MState = MState {
   _queue :: Q.MinQueue Query,
   -- overapprox: facts true about the i depth unfolding of the rule
@@ -118,6 +132,7 @@ data MState = MState {
   -- underapprox: implies rule
   -- (forall args. reach(args) => rule(args))
   _rho :: HashMap Rule F,
+  _preds :: HashMap Rule PredState,
   _solver :: S.Solver
 }
 
@@ -139,7 +154,7 @@ instance MonadS M where
 instance (MonadS m, MonadTrans t, Monad (t m), Fresh (t m), MonadIO (t m)) => MonadS (t m) where
   liftS = lift . liftS
 
--- TODO: remove this, as it's unused (or replace it with a version that gets to choose the variable naming?)
+-- TODO: remove this, as it's unused
 class Monad m => Declare m where
   declare :: SExpr -> Name SExpr -> m ()
 instance Declare M where
@@ -260,20 +275,30 @@ unfold strat r args = case prims ^. at (_ruleName r) of
               Just f -> pure $ f $ fmap tm2expr ys
               Nothing -> strat r ys
 
-unfold' :: forall m. (Fresh m, Declare m) => (Rule -> [Term] -> m SExpr) -> Clause -> m SExpr
+unfold' :: forall m. (Fresh m, Declare m) => (Rule -> [Term] -> m SExpr) -> Clause -> m ([(SExpr, Name SExpr)], SExpr)
 unfold' strat (Clause cls) = do
   -- we define internal variables using fresh names from unbound
   -- TODO: figore out how to keep info in the smt solver instead of asserting it each query
   -- (by unfolding each rule once, then keeping around the naming of vars & using an assumption var to enable it when needed mb)
   (rvs,rhs) <- unbind cls
   for_ rvs (declare (B "Tm") . coerce)
-  sAnd <$> for rhs (uncurry g)
+  r <- sAnd <$> for rhs (uncurry g)
+  pure ((B "Tm",) <$> coerce rvs, r)
   where g :: Rule -> [Term] -> m SExpr
         g r ys = case prims ^. at (_ruleName r) of
               Just f -> pure $ f $ fmap tm2expr ys
               Nothing -> strat r ys
               
-
+unfoldVs :: forall m. (Fresh m, Declare m) => (Rule -> [Term] -> m SExpr) -> Clause -> [Name SExpr] -> m SExpr
+unfoldVs strat (Clause cls) vs = do
+  (rvs,rhs) <- unbind cls
+  for_ rvs (declare (B "Tm") . coerce)
+  let rhs' = substs (zipWith (\n v -> (n, Var $ coerce v)) rvs vs) rhs
+  sAnd <$> for rhs' (uncurry g)
+  where g :: Rule -> [Term] -> m SExpr
+        g r ys = case prims ^. at (_ruleName r) of
+              Just f -> pure $ f $ fmap tm2expr ys
+              Nothing -> strat r ys  
 
 bmc :: Rule -> M SExpr
 bmc r = unroll 10 r []
@@ -357,17 +382,17 @@ spacer = (Q.minView <$> use queue) >>= \case
       scope $ do
         s <- use solver
         declareVars $ _queryExists query
-        (xs,dvs) <- runDeclaredVarsT $ flip runStateT mempty $ do
-          q <- unfold' (cook (lvl-1)) cls
+        ((dvs,q),as) <- flip runStateT mempty $ do
+          (vs,q) <- unfold' (cook (lvl-1)) cls
           print q
           liftIO $ do
             S.assert s $ sexpr2smtexpr q
             S.assert s $ sexpr2smtexpr $ _queryP query
-          pure q
-        let vs = dvs ++ _queryExists query
-        r <- liftIO $ approx_maxsat s (fmap A $ toListOf (_2 . traverse . traverse . _1) xs) $ check s $ fmap snd vs
+          pure (vs,q)
+        let vs = dvs ++ _queryExists query ++ fmap ((B "Tm",) . fst) (toListOf (traverse . traverse) as)
+        r <- liftIO $ approx_maxsat s (fmap A $ toListOf (traverse . traverse . _1) as) $ check s $ fmap snd vs
         -- liftIO $ print $ ppValues model
-        pure (r, xs, vs, cls)
+        pure (r, q, as, dvs, cls)
     if all ((== Unsat) . view _1) ls then do
       -- TODO: actually do full mbp
       print $ P.red "Unreachable, updating sigma"
@@ -383,10 +408,7 @@ spacer = (Q.minView <$> use queue) >>= \case
                     Just m -> [x & _1 .~ m]
                     Nothing -> []
              true_in_model model v = anyOf (ix (show v)) (== S.Bool True) model
-             als = filter (allOf (lensProduct _1 (_2 . _2)) (\(model, as) -> all (true_in_model model) $ concat $ toList as)) ls'
-            --  is_x :: (S.Value -> Bool) -> HashMap String S.Value -> Name SExpr -> Bool
-            --  is_x p model var = anyOf (ix (show var)) p model
-            --  g = fmap (\t -> (t, filter (not . is_x (== S.Bool True) (t ^. _1) . snd) (t ^. _))) ls'
+             als = filter (\x -> allOf (_3 . traverse . traverse . _1) (true_in_model (x ^. _1)) x) ls'
       in 
       if (not . null) als then do
         -- TODO: should make rho = branch that was reachable
@@ -399,47 +421,44 @@ spacer = (Q.minView <$> use queue) >>= \case
         -- TODO: is this right
         -- should minimize the exists here
         print ua
+        -- TODO: this is hack since z3 is unhappy about non top level exists even if no alternations
+        -- revisit this once we impl skolems
+        -- z3 projects here depending on a flag
         rho . at (_queryRule query) .= Just (bind avs $ sExists uvs ua)
+        -- rho . at (_queryRule query) .= Just (bind avs $ pMbp (als ^?! _head . _1) uvs ua)
+        queue .= queue'
+      else if lvl <= 0 then
+        -- TODO: should this be <= -1?
         queue .= queue'
       else do
-        print $ P.yellow "Reachable with assumptions: " <> P.text (show $ fmap (^. _2 . _2) ls')
+        print $ P.yellow "Reachable with assumptions: " <> P.text (show $ fmap (^. _3) ls')
         -- TODO: should we only queue first so that later branches can use improved sigmas?
-        for_ ls' $ \(model, (q, as), vs, cls) -> do
+        for_ ls' $ \(model, _, as, vs, cls) -> do
+          print as
+          print model
           -- TODO: mb have type RuleTag = (Rule, Int) for nth occ of rule
-          -- & use that to simplify this stuff
-          let (child_rule,(_,child_args)) = as ^@?! (itraversed <. traverse . filtered (not . true_in_model model . fst))
-          -- TODO: need to cook a version with sigma/rho chosen by assumptions & vars named according to model
-          -- or get it by simplification?
-          -- let (child_rule,args) = as
-          --       & singular (itraversed <. traverse . filtered (not . true_in_model model)) %%@~ _
-          -- let (child_rule,rhos_model) = as
-          --       & fmap reverse
-          --       & (traverse . traverse) %~ (Just . true_in_model model)
-          --       & singular (itraversed <. traverse . filtered (== Just False)) %%@~ (\r _ -> (r, Nothing))
-          -- ((qr',(_,Just child_args)),dvs') <- runDeclaredVarsT $ flip runStateT (rhos_model, Nothing) $ scope $ unfold' (cook_with_map (lvl-1)) cls
-          -- print qr'
+          -- & use that to simplify this stuff (unfold variants)
+          let (child_rule,(child_avar,child_args)) = as ^@?! (itraversed <. traverse . filtered (not . true_in_model model . fst))
+          (q,_) <- flip runStateT (as & fmap reverse) $ unfoldVs (cook_with_model model child_avar (lvl-1)) cls $ fmap snd vs
+          -- TODO: mbp here
+          -- (need to not mbp out vars in queryArgs, or add vars for args & conjoin args = vars & mbp out all other vars)
           queue %= (Q.insert $ Query {
             _queryLvl = lvl - 1,
             _queryRule = child_rule,
             _queryArgs = child_args,
-            _queryExists = vs,
+            _queryExists = vs ++ _queryExists query,
             _queryP = sAnd [q, _queryP query],
             -- TODO: this is wrong :/, need model of dvs'
             _queryModel = model
           })
           pure ()
-    -- undefined
-    --     else if lvl <= 0 then
-    --       -- TODO: is this in the right place? should it be <= 1?
-    --       -- TODO: is this reachable(is this check redundant?) if sigma -1 = false ?
-    --       -- TODO: report unknown
-    --       queue .= queue'
+
   Nothing -> pure ()
   where
     -- each rule has a list of it's instances
     -- for each instance, we store args & bool var which signals if underapprox was satisfied by model (in which case don't need to query that rule)
     cook :: Int -> Rule -> [Term] -> StateT (HashMap Rule [(Name SExpr,[Term])])
-     (DeclaredVarsT M) SExpr
+     M SExpr
     cook lvl r ys = do
       a <- fresh $ s2n (r ^. ruleName)
       liftS $ declare (B "Bool") a
@@ -448,20 +467,20 @@ spacer = (Q.minView <$> use queue) >>= \case
       at r . non [] %= ((a,ys):)
       pure $ sAnd [o, L [B "=", A a, u]]
 
-    -- cook_with_map :: Model -> Name SExpr -> Int -> Rule -> [Term] -> StateT (HashMap Rule [Name SExpr], Maybe [Term]) (DeclaredVarsT M) SExpr
-    -- cook_with_map m qr lvl r ys = do
-    --   Just (x:xs) <- use (_1 . at r)
-    --   _1 . at r .= Just xs
-    --   if x == qr then do
-    --     print ys
-    --     _2 .= Just ys
-    --   else case modelVal m x of
-    --     S.Bool True -> do
-    --       -- TODO: should we just do under?
-    --       o <- liftS $ over lvl r ys
-    --       u <- liftS $ under r ys
-    --       pure $ sAnd [u, o]
-    --     S.Bool False -> liftS $ over lvl r ys
+    cook_with_model :: Model -> Name SExpr -> Int -> Rule -> [Term] -> StateT (HashMap Rule [(Name SExpr,a)]) M SExpr
+    cook_with_model m qr lvl r ys = do
+      Just ((x,_):xs) <- use (at r)
+      at r .= Just xs
+      if x == qr then do
+        print ys
+        pure $ B "true"
+      else case modelVal m (A x) of
+        B "true" -> do
+          -- TODO: should we just do under?
+          o <- liftS $ over lvl r ys
+          u <- liftS $ under r ys
+          pure $ sAnd [u, o]
+        B "false" -> liftS $ over lvl r ys
     --   -- case x of
     --   --   Just True -> do
     --   --     o <- liftS $ over lvl r ys
@@ -498,7 +517,7 @@ spacer = (Q.minView <$> use queue) >>= \case
 run m = do
   l <- S.newLogger 1
   s <- S.newSolver "z3" ["-smt2","-in"] $ Just l
-  let st = MState mempty mempty mempty s
+  let st = MState mempty mempty mempty mempty s
   S.declareDatatype s "Tm" [] [
     ("Tm_int", [("tm_int", S.tInt)]),
     ("Tm_tree", [("tm_head", S.Atom "String"), ("tm_children", S.List [S.Atom "List", S.Atom "Tm"])])]

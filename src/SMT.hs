@@ -99,32 +99,58 @@ _A _ x = pure x
 pattern Eq :: SExpr -> SExpr -> SExpr
 pattern Eq x y = L [B "=", x, y]
 
+-- just uses B for everything instead of resolving binding structure
+smtexpr2sexpr :: S.SExpr -> SExpr
+smtexpr2sexpr (S.List l) = L (smtexpr2sexpr <$> l)
+smtexpr2sexpr (S.Atom x) = B x
 
--- TODO: use Maybe?
-modelVal :: Model -> SExpr -> S.Value
+type Value = SExpr
+
+
+is_val :: SExpr -> Bool
+is_val x | traceShow x True = False
+
+sBool :: Bool -> SExpr
+sBool True = B "true"
+sBool False = B "false"
+
+-- partially evaluate by a model
+modelVal :: Model -> SExpr -> SExpr
 modelVal m = go where
-  go :: SExpr -> S.Value
-  go (Eq x y) = S.Bool $ go x == go y
+  go :: SExpr -> SExpr
+  go (Eq x y) = if is_val x && is_val y then sBool (x == y) else Eq x y
+    where x' = go x
+          y' = go y
+    --S.Bool $ go x == go y
   go (A v) = case m ^? ix (show v) of
-    Just x -> x
-    Nothing -> error $ "Undefined var: " <> show v <> " model: " <> show m
+    Just x -> smtexpr2sexpr $ S.value x
+    Nothing -> A v
   -- go (L l) = error $ show l
-  go (L [B "tm_head", x]) = error $ show $ go x
-  go x = error $ show x
+  go (L [B "let",L vs,b]) = go (rewriteOf uniplate g b) where
+    g (B x) = lookup x bs
+    bs = fmap (\(L [B a,b]) -> (a,b)) vs
+  -- go (L [B "tm_head", x]) = S.Other $ S.Atom $ error $ show $ go x
+  go x = x
+  -- go x = S.Other $ S.List $ error $ show x
+  -- go x = error $ show x
 
 -- TODO: 
 
 -- use the model to choose a branch from disjunctions
 -- returns a list, where And l is an underapprox of the input
 mbpOr :: Model -> SExpr -> [SExpr]
+mbpOr _ x | traceShow x False = undefined
 mbpOr _ (B "true") = []
 mbpOr _ (Eq x y) = [Eq x y]
 mbpOr _ (L [B "not",x]) = [x]
 mbpOr m (L (B "and":l)) = mbpOr m =<< l
-mbpOr m (L (B "or":l)) = case filter (all ((== S.Bool True) . modelVal m)) (mbpOr m <$> l) of
-  (x:_) -> x
+mbpOr m (L (B "or":l)) = case filter (not . any ((== B "false") . modelVal m)) (mbpOr m <$> l) of
+  -- TODO: choose among alts with value in model & leave any without a value
+  [x] -> x
+  l -> [sOr $ fmap sAnd l]
   [] -> []
-mbpOr m x = traceShow x undefined
+mbpOr _ x = [x]
+-- mbpOr m x = traceShow x undefined
 
 
 -- a mbp plugin:
@@ -143,6 +169,7 @@ pMbp m vs b = case views (_And . _Eq) f b' of
   where
     fixEq f x = let r = f x in if r == x then x else fixEq f r
 
+    -- b' = b & _And %~ fixEq g
     b' = (sAnd $ mbpOr m b) & _And %~ fixEq g
 
     ns = fmap snd vs
