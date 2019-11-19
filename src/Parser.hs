@@ -2,7 +2,7 @@
 
 module Parser where
 
-import Text.Parsix hiding (ident)
+import Text.Trifecta hiding (ident)
 import Prelude hiding (noneOf)
 
 -- TODO: split into var (just capital letters) & atom
@@ -23,7 +23,7 @@ term = Expr <$> ident <*> (
 
 
 parseClause :: String -> [Expr]
-parseClause src = case parseString (rhs <* eof) src "" of 
+parseClause src = case parseString (rhs <* eof) mempty src of 
   Success x -> x
   Failure e -> error $ show e
 

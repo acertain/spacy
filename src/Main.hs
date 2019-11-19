@@ -2,7 +2,7 @@
 module Main where
 
 import Unbound.Generics.LocallyNameless
--- import Unbound.Generics.LocallyNameless.Bind
+import qualified Unbound.Generics.LocallyNameless.Bind
 import qualified Data.IntMap.Internal
 import qualified Data.IntMap.Lazy as IM
 import Parser
@@ -20,12 +20,12 @@ import GHC.Stack
 import SExpr
 import SMT
 import Control.Lens.Unsound
+import System.Mem.Weak
+import Data.HashSet (HashSet)
+import Control.DeepSeq
 
-
-
--- TODO: see what z3's spacer.ground_pobs does
--- (slides say to turn it off for spacer)
-
+-- TODO: switch away from unbound?
+-- really want a version without the semi-mandatory handling of free vars + freshening (or with it easier to disable)
 
 -- import Language.SMTLib2.Debug
 -- import Language.SMTLib2.Pipe
@@ -36,7 +36,7 @@ import Control.Lens.Unsound
 -- import qualified Data.SBV.List as L
 
 -- SVar to just to make conversion to smt easier
--- currently, we're abusing Var instead of having a SVar
+-- currently, we're abu; Var instead of having a SVar
 data Term = Var (Name Term) | Constr String [Term] | SExpr (Ignore SExpr)
   -- | SVar (Ignore (Name SExpr))
   deriving (Show, Generic, Data, Eq)
@@ -45,8 +45,11 @@ data Term = Var (Name Term) | Constr String [Term] | SExpr (Ignore SExpr)
 newtype Clause = Clause (Bind [Name Term] [(Rule,[Term])])
   deriving (Show, Generic, Data)
 
-
-
+-- unbind, but without freshening (just uses names as they were bound)
+-- TODO: use lunbind instead?
+unbindish :: (Alpha p, Alpha t) => Bind p t -> (p, t)
+unbindish (Unbound.Generics.LocallyNameless.Bind.B p t) = (p, open initialCtx (nthPatFind p) t)
+;
 instance Subst Term Term where
   isvar (Var x) = Just (SubstName x)
   isvar _ = Nothing
@@ -81,6 +84,8 @@ deriving instance Generic a => Generic (IntMap a)
 instance (Generic a, Alpha a) => Alpha (IntMap a)
 instance (Generic a, Subst b a) => Subst b (IntMap a)
 
+instance Hashable (Name a)
+
 sexpr2smtexpr :: SExpr -> S.SExpr
 sexpr2smtexpr (A n) = S.Atom $ show n
 sexpr2smtexpr (B x) = S.Atom x
@@ -90,17 +95,18 @@ data Query = Query {
   _queryLvl :: Int,
   _queryRule :: Rule,
   -- _queryP :: Bind [Name SExpr] SExpr
+  -- TODO: remove args
+  -- (only old spacer & bmc use it)
   _queryArgs :: [Term],
   -- TODO: this is bad w/ mbp (need to not project vars mentioned in R)
   -- so we should just have canonical vars for the args? or store vars in queryArgs
   -- should instead use special vars for args & use equality etc?
   -- i think z3 does this?? TODO: look at z3's mk_pob / formula_o2n
 
-  -- query is exists xs. P[xs] and R(*args[xs])
-  -- invariant: all vars in args or P must be in xs
-  -- currently these are delcared every query, but eventually we're going
-  -- to keep them declared & mb keep (part of?) queryP in the solver or something??
-  -- list of (ty,var)
+
+  -- TOOD: need to make sure these are disjoint w/ vars from rules
+  -- z3 does that by renaming them to sk!i
+  -- is good idea, let's do it!
   _queryExists :: [(SExpr,Name SExpr)],
   _queryP :: SExpr,
   _queryModel :: Model
@@ -115,15 +121,25 @@ instance Eq Query where
 instance Ord Query where
   compare = compare `on` _queryLvl
 
--- we just use variable names from the input for the solver, and rely on
--- well-scopedness of the input to give us locally unique variable names
 data PredState = PredState {
-  _predSolver :: S.Solver,
-  -- bool vars for clauses
-  _predClauseVars :: [Name SExpr]
-}
+  _psSolver :: S.Solver,
+  _psPredArgs :: [Name SExpr],
+  _psChildRules :: HashMap (Name SExpr) (Rule,[Term],[Name SExpr],IntMap Int),
+  -- -- TODO: generalize to non-dnf predicates
+  -- -- for each clause,
+  -- -- * assumption var to enable/disable that clause
+  -- -- * for each child rule,
+  -- --   - args
+  -- --   - asserted reach facts
+  -- --   - map lvl => asserted sigma_lvl up to before index j (still need to assert `drop j sigma_lvl`)
+  -- _psClauses :: [(Name SExpr, [(Rule,[Term],[Name SExpr],IntMap Int)])],
+  -- -- -- (assumption var, reach fact)
+  _psRho :: [(Name SExpr, SExpr)],
+  -- -- map lvl => facts
+  _psSigma :: IntMap [SExpr]
+} deriving (Show)
 
-
+instance Show S.Solver where show _ = ""
 
 data MState = MState {
   _queue :: Q.MinQueue Query,
@@ -138,6 +154,7 @@ data MState = MState {
 
 
 makeLenses ''MState
+makeLenses ''PredState
 
 newtype M a = M { runM :: StateT MState (FreshMT IO) a }
   deriving (Monad, MonadIO, MonadState MState, Fresh, Functor, Applicative, MonadFail)
@@ -164,7 +181,6 @@ instance Declare M where
     pure ()
 instance {-# OVERLAPPABLE #-} (Declare m, MonadTrans t, Monad (t m)) => Declare (t m) where
   declare n ty = lift $ declare n ty
-    
 
 newtype DeclaredVarsT m a = DeclaredVarsT { unDeclaredVarsT :: StateT [(SExpr,Name SExpr)] m a }
   deriving (Monad, MonadIO, Fresh, Functor, Applicative, MonadFail, MonadTrans)
@@ -176,6 +192,14 @@ instance {-# OVERLAPS #-} Declare m => Declare (DeclaredVarsT m) where
 
 runDeclaredVarsT :: DeclaredVarsT m a -> m (a, [(SExpr,Name SExpr)])
 runDeclaredVarsT m = runStateT (coerce m) []
+
+
+declare' :: MonadIO m => S.Solver -> SExpr -> Name SExpr -> m ()
+declare' s ty n = (liftIO $ S.declare s (show n) $ sexpr2smtexpr ty) >> pure ()
+
+
+assert' :: MonadIO m => S.Solver -> SExpr -> m ()
+assert' s x = liftIO $ S.assert s $ sexpr2smtexpr x
 
 clause :: HashMap String Rule -> [Name Term] -> String -> Clause
 clause rules env src = Clause $ bind (fmap s2n fvs) $ fmap (\(Expr x xs) -> (ln x, fmap f xs)) c
@@ -256,8 +280,9 @@ inst b l = do
   pure $ substs (zip vs l) c
 
 -- cb should return a formula, used as approx for rule(*args)
--- 
--- TODO: return list of new vars used instead of declaring them?
+-- TODO: cb should get occ location
+-- think about how 2 use it usefully
+-- mb parameterize over how to do or & and?
 unfold :: forall m. (Fresh m, Declare m) => (Rule -> [Term] -> m SExpr) -> Rule -> [Term] -> m SExpr
 unfold strat r args = case prims ^. at (_ruleName r) of
   Just f -> pure $ f $ fmap tm2expr args
@@ -300,6 +325,41 @@ unfoldVs strat (Clause cls) vs = do
               Just f -> pure $ f $ fmap tm2expr ys
               Nothing -> strat r ys  
 
+-- TODO: consider doing clause at a time
+-- , since if doing so can keep track of what clauses remain to check
+-- & allow forgetting facts without totally losing progress / be a hybrid of normal prolog evaluation
+-- otoh could just keep solver instances from stack around even if forgetting facts?
+-- (keep the old asserted sigma_i too)
+
+-- returns intermediate vars.
+-- only needs fresh due to unbound deficiency, doesn't actually use it for naming returned vars
+unfoldP :: forall m. Fresh m =>
+            (Name SExpr -> SExpr -> SExpr -> m SExpr) ->
+            (Name SExpr -> Rule -> [Term] -> m SExpr) ->
+            Rule -> [Term] -> m ([Name SExpr], SExpr)
+unfoldP sOr strat r args = flip evalStateT (0, 0) $ do
+    body <- inst (_ruleBody r) args
+    clss <- ifor body $ \i (Clause cls) -> do
+      (rvs,rhs) <- unbind cls
+      let rvs' = fmap (\n -> s2n (name2String n ++ "_" ++ show i)) rvs
+      let rhs' = substs (zipWith (\v x -> (v, Var x)) rvs rvs') rhs
+      x <- sAnd <$> for rhs' (uncurry g)
+      pure (rvs', x)
+    let vs = foldMap fst clss
+    x <- foldr1 h $ fmap (pure . snd) clss
+    pure (vs, x)
+    where
+      h x y = do
+        x' <- x
+        y' <- y
+        i <- _2 <%= (+1)
+        lift $ sOr (s2n $ "cls_" ++ show i) x' y'
+      g r ys = case prims ^. at (_ruleName r) of
+              Just f -> pure $ f $ fmap tm2expr ys
+              Nothing -> do
+                i <- _1 <%= (+1)
+                lift $ strat (s2n $ "child_" ++ show i) r ys
+
 bmc :: Rule -> M SExpr
 bmc r = unroll 10 r []
   where
@@ -308,12 +368,8 @@ bmc r = unroll 10 r []
     unroll k r args = unfold (unroll (k-1)) r args
 
 
-ppValues :: HashMap String S.Value -> Doc
-ppValues = P.vsep . fmap (\(k, v) -> P.cyan (P.text k <> " = ") <> f v) . itoList where
-  f (S.Other e) = ppSExpr $ g e
-  f x = P.text $ show x
-  g (S.Atom x) = B x
-  g (S.List l) = L $ fmap g l
+ppValues :: HashMap String SExpr -> Doc
+ppValues = P.vsep . fmap (\(k, v) -> P.cyan (P.text k <> " = ") <> ppSExpr v) . itoList
 
 
 rule_children :: Rule -> [Rule]
@@ -323,6 +379,13 @@ rule_children = nub . toListOf template
 
 declareVars :: [(SExpr,Name SExpr)] -> M ()
 declareVars vs = for_ vs (uncurry declare)
+
+scope' :: MonadIO m => S.Solver -> m a -> m a
+scope' s x = do
+  liftIO $ S.push s
+  r <- x
+  liftIO $ S.pop s
+  pure r
 
 scope :: MonadS m => m a -> m a
 scope x = do
@@ -346,20 +409,348 @@ approx_maxsat s (x:xs) cont = do
     S.Unsat -> S.pop s >> approx_maxsat s xs cont
     S.Unknown -> cont
 
-data SMTResult = Sat (HashMap String S.Value) | Unsat | Unknown
-  deriving (Eq)
+data SMTResult = Sat (HashMap String SExpr) | Unsat | Unknown
+  deriving (Eq, Show)
 
-_Sat :: Traversal' SMTResult (HashMap String S.Value)
+_Sat :: Traversal' SMTResult (HashMap String SExpr)
 _Sat f (Sat x) = Sat <$> f x
 _Sat _ x = pure x
 
 check :: S.Solver -> [Name SExpr] -> IO SMTResult
 check s vs = S.check s >>= \case
-  S.Sat -> Sat . fromList <$> S.getConsts s (fmap show vs)
+  S.Sat -> Sat . fmap (smtexpr2sexpr . S.value) . fromList <$> S.getConsts s (fmap show vs)
   S.Unsat -> pure Unsat
   S.Unknown -> pure Unknown
 
+
+check' :: S.Solver -> IO SMTResult
+check' s = S.check s >>= \case
+  S.Sat -> Sat <$> getModel s
+  S.Unsat -> pure Unsat
+  S.Unknown -> pure Unknown
   
+  
+
+getModel :: S.Solver -> IO (HashMap String SExpr)
+getModel s = do
+  S.check s
+  r <- S.command s $ sexpr2smtexpr $ L [B "get-model"]
+  let L (B "model":r') = smtexpr2sexpr r
+  pure $ fromList $ fmap (\(L [B "define-fun", B x, L [], _, v]) -> (x, v)) r'
+
+
+ruleState :: Rule -> M PredState
+ruleState r = do
+  ps <- use (preds . at r)
+  case ps of
+    Just v -> pure v
+    Nothing -> do
+      ps <- init_pred r
+      preds . at r .= Just ps
+      pure ps
+
+-- _ruleState :: MonadS m => (PredState -> m PredState) -> Rule -> m 
+
+
+-- nonPred :: MonadS f => (PredState -> f PredState) -> (Maybe PredState -> f (Maybe PredState))
+-- nonPred f Nothing = do
+--   x <- liftS init_pred 
+
+-- TODO: spacer' is wrong in lots of ways,
+-- mostly due to bad variable scoping
+-- / variable collisions
+-- e.g. for quantifiers, need to
+-- not reuse vars from context
+
+-- mb should just do globally unique?
+
+-- i think spacer gets away with just primed & not & slokems
+-- def need to use skolems or de bruijn or something for foralls/exists
+-- or manage instantiations & don't tell z3 forall or exists
+-- & don't use quantified lemmas when computing queries & new lemmas
+-- 
+
+-- TODO: ask arie how z3 deals with quantifiers when building queries & lemmas
+-- 
+
+init_pred :: Rule -> M PredState
+init_pred r = do
+  s <- liftIO $ do
+    l <- S.newLogger 1
+    s <- S.newSolver "z3" ["-smt2","-in"] $ Just l
+    S.declareDatatype s "Tm" [] [
+      ("Tm_int", [("tm_int", S.tInt)]),
+      ("Tm_tree", [("tm_head", S.Atom "String"), ("tm_children", S.List [S.Atom "List", S.Atom "Tm"])])]
+    addFinalizer s (S.stop s >> pure ())
+    pure s
+  -- used to determine which summary facts to enable
+  declare' s (B "Int") $ s2n "lvl"
+  -- we just use variable names from the input for the solver,
+  -- relying on prolog not having any local binders
+  -- then only need to make names for assumption vars
+  let (vs,_) = unbindish (_ruleBody r)
+  for_ vs (declare' s (B "Tm") . coerce)
+  print vs
+  print r
+  (e,(m,a)) <- flip runStateT mempty $ unfoldP (g s) (f s) r (fmap Var vs)
+  for_ (fst e) (declare' s (B "Tm"))
+  assert' s $ sAnd a
+  -- as <- for clss $ \(Clause cls) -> do
+  --   v <- fresh $ s2n "cls"
+  --   (cvs,cb) <- unbind cls
+  --   -- let (cvs,cb) = unbindish cls
+  --   liftIO $ do
+  --     declare' s (B "Bool") v
+  --     for_ cvs (declare' s (B "Tm") . coerce)
+  --   pure (v, fmap (uncurry (,,mempty,mempty)) cb)
+  -- liftIO $ S.assert s $ sexpr2smtexpr $ sOr $ fmap (A . view _1) as
+  print e
+  assert' s $ snd e
+  pure $ PredState {
+    _psSolver = s,
+    _psPredArgs = coerce vs,
+    _psChildRules = m,
+    -- _psClauses = as,
+    _psRho = mempty,
+    _psSigma = mempty
+  }
+  where
+  -- f :: S.Solver -> Name SExpr -> Rule -> [Term] -> StateT _ M SExpr
+  f s n r xs = do
+    declare' s (B "Bool") n
+    _1 . at n .= Just (r, xs, mempty, mempty)
+    _2 <>= [sImplies (A n) $ sImplies (L [B "<=", B "lvl", B "0"]) $ B "false"]
+    pure $ A n
+  g :: S.Solver -> Name SExpr -> SExpr -> SExpr -> StateT _ M SExpr
+  g s n x y = do
+    declare' s (B "Bool") n
+    let v = A n
+    -- this is a disjunction:
+    -- need a way to get which branch was used from the model,
+    -- and need to propagate info about which rules to query
+    -- at the leaves (child rules), the returned vars only cause obligations if they're true
+    -- so can force one to be false here
+    -- in fact, doing so makes it easier to generate queries: just query whichever is true
+    -- huh?
+    -- TODO: this is wrong if unfold takes prims as is instead of making them only needed for true
+    -- TODO: consider rewriting unfold to work top-down (pushing down assumption vars)
+    _2 <>= [sEq v x, sEq (sNot v) y]
+    -- _2 <>= [sImplies (sAnd [x, y]) v, sImplies (sNot v) (sNot $ sOr [x,y])]
+    -- pure v
+    pure $ sOr [v,sNot v]
+
+
+-- TODO: could do things other than solver per pred
+-- e.g. one solver, keep however many instances of each pred's sigma/rho is needed
+-- to run queries, use equalities to activate them
+
+
+
+-- TODO: currently this puts rfs to use at the start of psClauses lists, maybe return them instead?
+pre_query :: Int -> PredState -> M PredState
+pre_query lvl ps =
+  iforOf (psChildRules .> itraversed) ps $ \a ro@(r, xs, rfs, ss) -> do
+    use (preds . at r) >>= \case
+      Nothing -> pure ro
+      Just rs -> do
+        rfs' <- case rs ^? psRho . _head of
+          Just (t,f) ->
+            if t `elem` rfs then pure (t:delete t rfs)
+            else do
+              let f' = substs (zipWith (\v x -> (v, tm2expr x)) (rs ^. psPredArgs) xs) f
+              assert' s $ sImplies (A a) $ sEq (A t) f'
+              pure (t:rfs)
+          Nothing -> pure rfs
+        let sfs = snd $ IM.split (lvl-1) (rs ^. psSigma)
+        -- TODO: try just doing = i & adding to >= sigma when learning new facts:
+        -- might be able to prune from higher lvls (due to more general preds)
+        dss <- ifor sfs $ \i f -> do
+          let f' = drop (ss ^. at i . non 0) f
+          let f'' = substs (zipWith (\v x -> (v, tm2expr x)) (rs ^. psPredArgs) xs) f'
+          -- TODO: should this be <= or = ?
+          unless (null f') $ assert' s $ sImplies (A a) $ sImplies (L [B "<=", B "lvl", B (show i)]) $ sAnd f''
+          pure $ length f
+        pure (ro & _3 .~ rfs' & _4 %~ (IM.unionWith max dss))
+  where s = ps ^. psSolver
+  -- forOf (psClauses . traverse) ps $ \(a,l) ->
+  --   fmap (a,) $ for l $ \ro@(r, xs, rfs, ss) ->
+  --     use (preds . at r) >>= \case
+  --       Nothing -> pure ro
+  --       Just rs -> do
+  --         rfs' <- case rs ^? psRho . _head of
+  --           Just (t,f) ->
+  --             if t `elem` rfs then pure (t:delete t rfs)
+  --             else do
+  --               let f' = substs (zipWith (\v x -> (v, tm2expr x)) (rs ^. psPredArgs) xs) f
+  --               assert' s $ sImplies (A a) $ sEq (A t) f'
+  --               pure (t:rfs)
+  --           Nothing -> pure rfs
+  --         let sfs = snd $ IM.split (lvl-1) (rs ^. psSigma)
+  --         dss <- ifor sfs $ \i f -> do
+  --           let f' = drop (ss ^. at i . non 0) f
+  --           -- TODO: should this be <= or = ?
+  --           unless (null f') $ assert' s $ sImplies (A a) $ sImplies (L [B "<=", B "lvl", B (show i)]) $ sAnd f'
+  --           -- assert' s $ L [B "=", L [B "=", B "lvl", B (show i)], sAnd f']
+  --           pure $ length f
+  --         pure (ro & _3 .~ rfs' & _4 %~ (IM.unionWith max dss))
+  --   where s = ps ^. psSolver
+
+
+-- brainstorming for better unfold abstraction:
+-- can do ors as in input program,
+-- then use the model to choose a branch from disjunctions to query
+-- instead of doing multiple queries, would do:
+-- unsat => unreachable
+-- sat => query whatever branch is true in model
+
+-- TODO: assert no skolems in x or count skolems in x
+-- mb? how's this used? is it sometimes legit to use skolems in x?
+-- (when insting foralls?)
+-- mb want to rename in sExists away from sk?
+skolemize :: [(SExpr,Name SExpr)] -> SExpr -> ([(SExpr,Name SExpr)], SExpr)
+skolemize vs x = (imap (\i (ty,_) -> (ty,  ski i)) vs, substs ss x)
+        where ss = imap (\i v -> (snd v, A $ ski i)) vs
+              ski i = s2n ("sk!" ++ show i)
+
+-- (%%%=) :: Optic ? ? s t a b -> (a -> m b) -> 
+-- l %%%= f = _
+--   -- do
+--   -- x <- 
+
+-- ruleState rule %%%= pre_query (lvl-1)
+
+
+-- type GivenSolver = (?solver :: Solver)
+
+
+run_query :: Query -> M (Maybe Bool)
+run_query query = do
+  print $ P.blue "Querying:"
+  print query
+  let rule = _queryRule query
+      prop = _queryP query
+      lvl = _queryLvl query
+
+  ps <- pre_query (lvl-1) =<< ruleState rule
+  preds . at rule .= Just ps
+
+  let s = ps ^. psSolver
+  scope' s $ do
+    assert' s (sEq (B "lvl") (B $ show lvl))
+    -- TODO: deal w/ queryArgs
+    assert' s prop
+    let rs = ps ^. psChildRules
+    let as = fmap fst $ itoList rs
+    -- TODO: max also rhos
+    -- actually just want to max rhos mb?
+    -- or like max sum_i=alts prod_j=conj [rho_ij!=1]*p(A_ij)
+    -- 
+    -- TODO: maxing as is maybe bad? because it prefers clauses w/ more preds? mb just do greedy opt? or reformulate this somehow?
+    liftIO (approx_maxsat s (fmap A as) (check' s)) >>= \case
+      Unsat -> do
+        let f = sNot $ pMbp (_queryModel query) (_queryExists query) prop
+        print $ P.red "Unreachable, updating sigma with:"
+        print f
+        -- print prop
+        preds . ix rule . psSigma . at lvl . non [] %= (++ [f])
+        pure $ Just False
+      Sat m -> do
+        -- the child rules the model depends on
+        let as' = filter (true_in_model m) as
+        -- TODO: mb do any instead of only checking first?
+        case find (\v -> let x = rs ^?! ix v . _3 in null x || not (true_in_model m $ head x)) as' of
+          Nothing -> do
+            print $ P.green "Reachable with no assumptions"
+            undefined
+          Just k -> if lvl < 0 then
+            error "At lvl < 0 but reachable with assumptions, this is an internal error"
+            else do
+            let x = rs ^?! ix k
+            -- TODO: need to impl the q3 paper (instantiating skolems i think)
+            -- (let's check all 3 branches against it!)
+            print $ P.yellow "Reachable with assumptions, querying " <> P.text (show x)
+            -- TODO: need to do capture avoidant naming/substn at various points here
+            (xs,q) <- unfoldP (\v x y -> pure $ if true_in_model m v then x else y) (f (lvl-1) m rs) rule (_queryArgs query)
+            let argvars = fmap (\i -> s2n ("var!" ++ show i)) [1..]
+            let (qvs,q') = pMbp' m (fmap (B "Tm",) xs ++ _queryExists query) $ sAnd (q:zipWith sEq (fmap A argvars) (fmap tm2expr (x ^. _2)))
+            rule_ps <- ruleState (x ^. _1)
+            print rule_ps
+            let ruleargs = rule_ps ^. psPredArgs
+            let q'' = substs (zip argvars $ fmap A ruleargs) q'
+            let (sks,q3) = skolemize qvs q''
+              -- case q'' of
+                      -- L [B "exists", vs, b] -> let (vs',b') = skolemize vs b in sExists vs' b'
+                      -- x -> x
+            deepseq q'' (pure ())
+            -- should mbp query and (args = vars) then skolemize
+            -- 
+            -- let (ss, q') = skolemize (fmap (B "Tm",) xs ++ _queryExists query) (sAnd [q, prop])
+
+            -- print (xs, q)
+            -- print $ x ^. _2
+            queue %= (Q.insert $ Query {
+              _queryLvl = lvl - 1,
+              _queryRule = x ^. _1,
+              _queryArgs = fmap Var $ coerce ruleargs,
+              -- _queryExists = sks,
+              -- _queryP = q3,
+              _queryExists = [],
+              -- _queryP = sExists sks q3,
+              _queryModel = m,
+              _queryP = sExists qvs q''
+            })
+            pure Nothing
+        -- case ifind _ (ps ^. psChildRules) of
+        --   Just x -> _
+        --   Nothing -> _
+    -- if all (not . true_in_model m) as then do
+    --   _
+    -- else do
+    --   _
+    -- ls <- for (ps ^. psClauses) $ \(cv, rls) ->
+    --   scope' s $ do
+    --     assert' s (A cv)
+    --     let as = toListOf (traverse . _3 . _head) rls
+    --     m <- liftIO $ approx_maxsat s (fmap A as) (check' s)
+    --     pure (m, rls)
+    -- if all ((== Unsat) . view _1) ls then do
+    --   print $ P.red "Unreachable, updating sigma"
+    --   undefined
+    -- else
+    --   let
+    --       ls' = ls >>= \x -> case x ^? (_1 . _Sat) of
+    --               Just m -> [x & _1 .~ m]
+    --               Nothing -> []
+    --   in case find (\x -> allOf (_2 . traverse . _3) (\l -> has _head l && true_in_model (x ^. _1) (head l)) x) ls' of
+    --     Just x -> do
+    --       print $ P.green "Reachable with no assumptions"
+    --       undefined
+    --     Nothing -> do
+    --       print $ P.yellow "Reachable with assumptions"
+    --       let (model, cls) = head ls'
+    --       let (child_rule, child_args, _, _) = cls ^?! traverse . filtered (\x -> null (x ^. _3) || not (true_in_model model $ head $ x ^. _3))
+    --       q <- sAnd <$> for cls (f (lvl-1) model)
+    --       print q
+    --       undefined
+    where
+      true_in_model model v = anyOf (ix (show v)) (== B "true") model
+      f lvl m rls a r xs = do
+        let rs = rls ^?! ix a . _3 
+        ps <- ruleState r
+        let c = if has _head rs && true_in_model m (head rs) then
+                  fromJust $ lookup (head rs) (ps ^. psRho)
+                else
+                  sAnd $ concat $ toList $ snd $ IM.split (lvl-1) (ps ^. psSigma)
+        print c
+        pure $ substs (zipWith (\n v -> (n, tm2expr v)) (ps ^. psPredArgs) xs) c
+  --   --  print ls
+
+
+spacer' = (Q.minView <$> use queue) >>= \case
+    Just (query, queue') -> do
+      r <- run_query query
+      when (isJust r) (queue .= queue')
+    Nothing -> pure ()
 
 -- run 1 loop of spacer
 -- notes:
@@ -407,12 +798,12 @@ spacer = (Q.minView <$> use queue) >>= \case
     else let ls' = ls >>= \x -> case x ^? (_1 . _Sat) of
                     Just m -> [x & _1 .~ m]
                     Nothing -> []
-             true_in_model model v = anyOf (ix (show v)) (== S.Bool True) model
+             true_in_model model v = anyOf (ix (show v)) (== B "true") model
              als = filter (\x -> allOf (_3 . traverse . traverse . _1) (true_in_model (x ^. _1)) x) ls'
-      in 
+      in
       if (not . null) als then do
+        let (model, _, as, vs, cls) = als ^?! _head
         -- TODO: should make rho = branch that was reachable
-        let cls = als ^?! _head . _4
         print $ P.green "Reachable with no assumptions"
         avs <- ruleVars rule
         -- (avs,_) <- unbind (query ^. queryRule . ruleBody)
@@ -552,7 +943,7 @@ spacer_n :: (Int -> M Query) -> M ()
 spacer_n f = do
   x <- f 0
   queue %= Q.insert x
-  replicateM_ 20 spacer
+  replicateM_ 20 spacer'
   q <- use queue
   when (Q.null q) $ spacer_n (\i -> f (i + 1))
 

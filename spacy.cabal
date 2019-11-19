@@ -55,25 +55,31 @@ executable spacy
     optparse-applicative,
     bytestring >=0.10 && <0.11,
     constraints >= 0.8,
-    ghc-typelits-natnormalise >= 0.4,
-    ghc-typelits-knownnat,
-    singletons,    
+    -- ghc-typelits-natnormalise >= 0.4,
+    -- ghc-typelits-knownnat,
+    -- singletons,    
     vector,
     primitive,
     megaparsec,
     basic-prelude,
-    parsix, parsers,
+    -- parsix,
+    trifecta,
+    parsers,
     deepseq,
     Cabal,
     vault,
-    exceptions, sbv, unbound-generics, pqueue,
-    simple-smt, smtlib2, smtlib2-pipe, smtlib2-debug
+    exceptions,
+    -- , sbv,
+    unbound-generics, pqueue,
+    simple-smt
+    -- , smtlib2, smtlib2-pipe, smtlib2-debug
     -- sbv, deepseq, validation  
   hs-source-dirs:      src
   default-language:    Haskell2010
   ghc-options:
     -rtsopts
     "-with-rtsopts=-xc -M1G -p"
+    -fno-warn-partial-type-signatures
     -- -with-rtsopts=-M1G
     -- -with-rtsopts=-p
     -fprof-auto

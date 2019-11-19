@@ -7,6 +7,7 @@ import Unbound.Generics.LocallyNameless.Name
 import Unbound.Generics.LocallyNameless.Ignore
 import qualified Text.PrettyPrint.ANSI.Leijen as P
 import Data.Data.Lens
+import Control.DeepSeq
 
 
 -- TODO: add constructor for datatypes, that holds metadata, to allow
@@ -22,6 +23,7 @@ instance Subst SExpr SExpr where
   isvar _ = Nothing
 
 instance Alpha SExpr
+instance NFData SExpr
 
 deriving instance Data a => Data (Ignore a)
 deriving instance Eq a => Eq (Ignore a)
@@ -34,6 +36,7 @@ ppSExpr :: SExpr -> Doc
 ppSExpr = g . inline_linear_lets where
   g (B a) = P.text a
   g (A a) = P.text $ show a
+  g (L []) = P.text "()"
   g (L [a]) = g a
   g (L [B "Tm_int",i]) = g i
   g (L [B "Tm_tree",B (strip_quotes -> Just n),unlist -> Just l]) = P.text n <> "(" <> intercalate "," (fmap g l) <> ")"

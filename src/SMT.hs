@@ -8,7 +8,7 @@ import qualified Data.List
 import Data.Data.Lens
 import Control.Lens.Plated
 
-type Model = HashMap String S.Value
+type Model = HashMap String SExpr
 
 deriving instance Data S.SExpr
 
@@ -26,6 +26,7 @@ unAnd (L (B "and":l)) = l
 unAnd a = [a]
 
 -- always matches!
+-- TODO: mb version that doesn't always match?
 pattern And :: [SExpr] -> SExpr
 pattern And l <- (unAnd -> l) where
   And l = sAnd l
@@ -44,20 +45,29 @@ sNot (L (B "and":as)) = sOr $ fmap sNot as
 sNot (L (B "or":as)) = sAnd $ fmap sNot as
 sNot (B "true") = B "false"
 sNot (L [B "exists",vs,b]) = L [B "forall",vs,sNot b]
+sNot (L [B "forall",vs,b]) = L [B "exists",vs,sNot b]
 sNot (L [B "not", x]) = x
 sNot x = L [B "not", x]
 
 sBind :: SExpr -> [(SExpr,Name SExpr)] -> SExpr -> SExpr
-sBind bndr vs body = case vs' of
+sBind bndr vs body = case clean_binds vs body of
   [] -> body
   l -> L [bndr, L $ fmap (\(ty,v) -> L [B (show v),ty]) l, body]
-  where mvs :: [Name SExpr]
-        mvs = toListOf fv body
-        vs' = filter (\(_,n) -> n `elem` mvs) vs
   
+-- remove vars from vs that b doesn't mention
+clean_binds :: [(SExpr,Name SExpr)] -> SExpr -> [(SExpr,Name SExpr)]
+clean_binds vs b = filter (\(_,n) -> n `elem` mvs) vs where
+  mvs :: [Name SExpr]
+  mvs = toListOf fv b
+
 -- TODO: use de bruijn? add constr to SExpr for binding forms?
 sExists :: [(SExpr,Name SExpr)] -> SExpr -> SExpr
 sExists = sBind (B "exists")
+
+-- unExists :: SExpr -> Maybe ([(SExpr, Name SExpr)], SExpr)
+-- unExists (L [B "exists"])
+
+-- pattern Exists vs b M
 
 sForall = sBind (B "forall")
 
@@ -65,20 +75,36 @@ sFvs :: SExpr -> [Name SExpr]
 sFvs = toListOf fv
 
 
-
+sImplies :: SExpr -> SExpr -> SExpr
+sImplies x y = L [B "=>", x, y]
 
 simplify :: SExpr -> SExpr
 simplify (L (B "and":l)) = sAnd $ fmap simplify l
-simplify x = rewriteOf uniplate r x where
+-- simplify (L [B "=", L [B "Tm_tree", B x, unlist -> Just l], L [B "Tm_tree", B y, unlist -> Just m]]) | x == y && length l == length m = simplify $ sAnd $ zipWith (\a b -> L [B "=", a, b]) l m
+simplify x = simplify' $ rewriteOf uniplate r x where
   -- TODO: generalze to all datatypes
   -- how? mb w/ more complex SExpr type? or with table of datatypes?
   r (L [B "=", L [B "Tm_tree", B x, unlist -> Just l], L [B "Tm_tree", B y, unlist -> Just m]]) | x == y && length l == length m = Just $ sAnd $ zipWith (\a b -> L [B "=", a, b]) l m
   r (L [B "=", x, y]) | x == y = Just $ B "true"
+  r (L [B "forall", _, B "true"]) = Just $ B "true"
   r _ = Nothing
 
   unlist (B "nil") = Just []
   unlist (L [B "insert", x, y]) = (x :) <$> unlist y
   unlist x | trace (show x) True = Nothing
+
+simplify' = go where
+  -- go (L [B "=", L [B "Tm_tree", B x, unlist -> Just l], L [B "Tm_tree", B y, unlist -> Just m]]) | x == y && length l == length m = go $ sAnd $ zipWith (\a b -> L [B "=", a, b]) l m
+  go (L [B "forall", vs, b]) = L [B "forall", vs, go b]
+  go (L (B "and":l)) = sAnd $ fmap go l
+  go (L [B "not",x]) = sNot $ go x
+  go (L (B "or":l)) = sOr $ fmap go l
+  -- go (L [B "forall", vs, b]) = L [B "forall", vs, go b]
+  go x = x
+
+  -- unlist (B "nil") = Just []
+  -- unlist (L [B "insert", x, y]) = (x :) <$> unlist y
+  -- unlist x | trace (show x) True = Nothing
 
 matchAnd :: (SExpr -> Maybe SExpr) -> SExpr -> Maybe SExpr
 matchAnd f (And l) = if any (isJust . snd) l' then Just $ sAnd (fmap (uncurry fromMaybe) l') else Nothing
@@ -123,7 +149,7 @@ modelVal m = go where
           y' = go y
     --S.Bool $ go x == go y
   go (A v) = case m ^? ix (show v) of
-    Just x -> smtexpr2sexpr $ S.value x
+    Just x -> go x
     Nothing -> A v
   -- go (L l) = error $ show l
   go (L [B "let",L vs,b]) = go (rewriteOf uniplate g b) where
@@ -139,7 +165,7 @@ modelVal m = go where
 -- use the model to choose a branch from disjunctions
 -- returns a list, where And l is an underapprox of the input
 mbpOr :: Model -> SExpr -> [SExpr]
-mbpOr _ x | traceShow x False = undefined
+-- mbpOr _ x | traceShow x False = undefined
 mbpOr _ (B "true") = []
 mbpOr _ (Eq x y) = [Eq x y]
 mbpOr _ (L [B "not",x]) = [x]
@@ -147,8 +173,8 @@ mbpOr m (L (B "and":l)) = mbpOr m =<< l
 mbpOr m (L (B "or":l)) = case filter (not . any ((== B "false") . modelVal m)) (mbpOr m <$> l) of
   -- TODO: choose among alts with value in model & leave any without a value
   [x] -> x
-  l -> [sOr $ fmap sAnd l]
   [] -> []
+  l -> [sOr $ fmap sAnd l]
 mbpOr _ x = [x]
 -- mbpOr m x = traceShow x undefined
 
@@ -158,19 +184,21 @@ mbpOr _ x = [x]
 -- * takes a conjunction, and says which indexes to remove & which new expressions to process & a substn & new vars
 
 
+pMbp m vs b = uncurry sExists $ pMbp' m vs b
+
 -- underapprox exists vs. b
 -- TODO: move some of this to sExists or mb simplify
 -- TODO: add model arg
-pMbp :: Model -> [(SExpr,Name SExpr)] -> SExpr -> SExpr
-pMbp m x y | trace (show x <> " " <> show y) False = undefined
-pMbp m vs b = case views (_And . _Eq) f b' of
-  [] -> sExists vs $ simplify b'
-  ss -> pMbp m vs $ simplify $ substs ss b'
+pMbp' :: Model -> [(SExpr,Name SExpr)] -> SExpr -> ([(SExpr, Name SExpr)],SExpr)
+pMbp' m x y | trace (show x <> " " <> show y) False = undefined
+pMbp' m vs b = case views (_And . _Eq) f b' of
+  [] -> let r = simplify b' in (clean_binds vs r, r)
+  ss -> pMbp' m vs $ simplify $ substs ss b'
   where
     fixEq f x = let r = f x in if r == x then x else fixEq f r
 
-    -- b' = b & _And %~ fixEq g
-    b' = (sAnd $ mbpOr m b) & _And %~ fixEq g
+    b' = b & _And %~ fixEq g
+    -- b' = (sAnd $ mbpOr m b) & _And %~ fixEq g
 
     ns = fmap snd vs
     f (y, A v) | elem v ns && notElem v (sFvs y) = [(v, y)]

@@ -28,7 +28,8 @@ module Prelude
    module Control.Monad.Trans.Maybe,
    module Data.Functor.Compose,
    module Control.Monad.Fail,
-   pack, unpack, module Data.Data
+   pack, unpack, module Data.Data,
+   fromJust
     ) where
 
 
@@ -96,3 +97,6 @@ unpack = T.unpack
 
 -- instance (Pretty k, Pretty v, Ord k) => Pretty (HashMap k v) where
 --   prettyPrec _ = pretty . sortOn fst . HM.toList
+
+
+fromJust (Just x) = x
