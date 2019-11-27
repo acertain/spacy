@@ -1,4 +1,5 @@
 {-# LANGUAGE PatternSynonyms, ViewPatterns #-}
+-- smtlib s-expr manipulation
 module SMT where
 
 import SExpr
@@ -168,7 +169,8 @@ mbpOr :: Model -> SExpr -> [SExpr]
 -- mbpOr _ x | traceShow x False = undefined
 mbpOr _ (B "true") = []
 mbpOr _ (Eq x y) = [Eq x y]
-mbpOr _ (L [B "not",x]) = [x]
+-- huh?
+-- mbpOr _ (L [B "not",x]) = [x]
 mbpOr m (L (B "and":l)) = mbpOr m =<< l
 mbpOr m (L (B "or":l)) = case filter (not . any ((== B "false") . modelVal m)) (mbpOr m <$> l) of
   -- TODO: choose among alts with value in model & leave any without a value
